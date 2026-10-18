@@ -9,6 +9,8 @@ import {
   eq,
   getTableColumns,
   gt,
+  inArray,
+  isNotNull,
   or,
   sql,
 } from "drizzle-orm";
@@ -737,6 +739,26 @@ function formatCount(value: number | null | undefined) {
   return value.toLocaleString("en-US");
 }
 
+export function shouldRotateIdleSession(input: {
+  finishedAt: Date | null | undefined;
+  contextTokens: unknown;
+  idleTtlMinutes: number;
+  idleMinContextTokens: number;
+  now?: number;
+}): boolean {
+  const finishedAtMs = input.finishedAt instanceof Date
+    ? input.finishedAt.getTime()
+    : Number.NaN;
+  const contextTokens = input.contextTokens;
+  const now = input.now ?? Date.now();
+  return input.idleTtlMinutes > 0 &&
+    input.idleMinContextTokens > 0 &&
+    Number.isFinite(finishedAtMs) &&
+    Number.isFinite(contextTokens) &&
+    (contextTokens as number) >= input.idleMinContextTokens &&
+    (now - finishedAtMs) / 60_000 > input.idleTtlMinutes;
+}
+
 export function parseSessionCompactionPolicy(
   agent: typeof agents.$inferSelect,
 ): SessionCompactionPolicy {
@@ -1282,6 +1304,8 @@ export function createHeartbeatRunState(db: Db) {
       .select({
         id: heartbeatRuns.id,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        status: heartbeatRuns.status,
         usageJson: heartbeatRuns.usageJson,
         error: heartbeatRuns.error,
         terminalFailureCategory: sql<string | null>`case
@@ -1344,6 +1368,58 @@ export function createHeartbeatRunState(db: Db) {
       sessionAgeHours >= policy.maxSessionAgeHours
     ) {
       reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
+    }
+
+    if (!reason && policy.idleTtlMinutes > 0 && policy.idleMinContextTokens > 0) {
+      const latestCompletedRun = runs.find((run) =>
+        ["succeeded", "failed", "cancelled", "timed_out"].includes(run.status),
+      );
+      const finishedAt = latestCompletedRun?.finishedAt;
+      const contextRun = runs
+        .filter((run) => {
+          const contextTokens = run.usageJson?.contextTokens;
+          return ["succeeded", "failed", "cancelled", "timed_out"].includes(run.status) &&
+            run.finishedAt instanceof Date &&
+            Number.isFinite(run.finishedAt.getTime()) &&
+            typeof contextTokens === "number" &&
+            Number.isFinite(contextTokens) &&
+            contextTokens >= 0;
+        })
+        .sort((left, right) => {
+          const leftFinishedAt = left.finishedAt instanceof Date ? left.finishedAt.getTime() : 0;
+          const rightFinishedAt = right.finishedAt instanceof Date ? right.finishedAt.getTime() : 0;
+          return rightFinishedAt - leftFinishedAt;
+        })[0];
+      let contextTokens = contextRun?.usageJson?.contextTokens;
+      if (contextTokens === undefined) {
+        const [contextMeasurement] = await db
+          .select({
+            contextTokens: sql<unknown>`${heartbeatRuns.usageJson} -> 'contextTokens'`.as("contextTokens"),
+          })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, agent.companyId),
+            eq(heartbeatRuns.agentId, agent.id),
+            eq(heartbeatRuns.sessionIdAfter, sessionId),
+            inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"]),
+            isNotNull(heartbeatRuns.finishedAt),
+            sql`case when jsonb_typeof(${heartbeatRuns.usageJson} -> 'contextTokens') = 'number'
+              then (${heartbeatRuns.usageJson} ->> 'contextTokens')::numeric >= 0 else false end`,
+          ))
+          .orderBy(desc(heartbeatRuns.finishedAt))
+          .limit(1);
+        contextTokens = contextMeasurement?.contextTokens;
+      }
+      const finishedAtMs = finishedAt instanceof Date ? finishedAt.getTime() : Number.NaN;
+      const idleMinutes = (Date.now() - finishedAtMs) / 60_000;
+      if (shouldRotateIdleSession({
+        finishedAt,
+        contextTokens,
+        idleTtlMinutes: policy.idleTtlMinutes,
+        idleMinContextTokens: policy.idleMinContextTokens,
+      })) {
+        reason = `session idle for ${Math.floor(idleMinutes)} minutes after reaching ${formatCount(contextTokens as number)} context tokens`;
+      }
     }
 
     if (!reason || !latestRun) {
