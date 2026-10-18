@@ -89,7 +89,9 @@ These are the Claude defaults. Other adapters keep idle rotation disabled. Eithe
 value of `0`, or `enabled: false`, disables this condition. Idle time starts at the
 last completed run and must exceed the TTL; context must meet the token threshold.
 The context measurement is ACP `usage_update.used`, not accumulated billing usage.
-A session with no context measurement keeps its existing resume policy. Set the TTL
+After the TTL, missing recent measurements fall back to at most 100 terminal runs
+for the agent through the existing start-time index, filtered to the same session.
+A session with no retained context measurement keeps its existing resume policy. Set the TTL
 to the cache lifetime of your provider/account; the 60-minute default is for Claude
 subscription sessions. Rotation uses the existing bounded task handoff.
 

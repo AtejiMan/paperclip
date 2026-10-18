@@ -8755,6 +8755,88 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
 
 
 describe("ACPX authoritative fresh session", () => {
+  it("clears an unavailable session when its fresh-session retry also fails", async () => {
+    const root = await makeTempRoot();
+    const ensureInputs: Array<Record<string, unknown>> = [];
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      createRuntime: () => ({
+        ...buildRuntime(),
+        ensureSession: async (input: Record<string, unknown>) => {
+          ensureInputs.push(input);
+          if (ensureInputs.length === 1) {
+            return { sessionKey: input.sessionKey, backendSessionId: "original", agentSessionId: "original", runtimeSessionName: "original" };
+          }
+          if (input.resumeSessionId) throw new Error("resume session not found");
+          throw new Error("fresh session setup failed");
+        },
+      }) as never,
+    });
+    const base = {
+      agent: { id: "agent-1", companyId: "company-1" },
+      config: { agent: "custom", agentCommand: "node fake.js", cwd: root, stateDir: path.join(root, "state") },
+      context: {}, onLog: async () => {}, onMeta: async () => {},
+    };
+    const first = await execute({ ...base, runId: "first", runtime: {} } as never);
+    const failedReplacement = await execute({
+      ...base,
+      runId: "failed-replacement",
+      runtime: { sessionParams: sessionCodec.deserialize(first.sessionParams) },
+    } as never);
+
+    expect(failedReplacement.clearSession).toBe(true);
+    expect(Object.hasOwn(failedReplacement, "sessionReused")).toBe(false);
+    expect(Object.hasOwn(failedReplacement, "sessionIdBefore")).toBe(false);
+    expect(ensureInputs[2]?.resumeSessionId).toBeUndefined();
+  });
+
+  it.each(["resume-error retry", "mismatched handshake"] as const)(
+    "keeps the replacement session resumable after a %s",
+    async (replacementPath) => {
+      const root = await makeTempRoot();
+      const ensureInputs: Array<Record<string, unknown>> = [];
+      const execute = createAcpxEngineExecutor({
+        warmHandles: new Map(),
+        createRuntime: () => ({
+          ...buildRuntime(),
+          ensureSession: async (input: Record<string, unknown>) => {
+            ensureInputs.push(input);
+            if (ensureInputs.length === 1) {
+              return { sessionKey: input.sessionKey, backendSessionId: "original", agentSessionId: "original", runtimeSessionName: "original" };
+            }
+            if (replacementPath === "resume-error retry" && input.resumeSessionId === "original") {
+              throw new Error("resume session not found");
+            }
+            const id = "replacement";
+            return { sessionKey: input.sessionKey, backendSessionId: id, agentSessionId: id, runtimeSessionName: id };
+          },
+        }) as never,
+      });
+      const base = {
+        agent: { id: "agent-1", companyId: "company-1" },
+        config: { agent: "custom", agentCommand: "node fake.js", cwd: root, stateDir: path.join(root, "state") },
+        context: {}, onLog: async () => {}, onMeta: async () => {},
+      };
+      const first = await execute({ ...base, runId: "first", runtime: {} } as never);
+      const replacement = await execute({
+        ...base,
+        runId: "replacement",
+        runtime: { sessionParams: sessionCodec.deserialize(first.sessionParams) },
+      } as never);
+      const resumed = await execute({
+        ...base,
+        runId: "resumed-replacement",
+        runtime: { sessionParams: sessionCodec.deserialize(replacement.sessionParams) },
+      } as never);
+
+      expect(replacement.sessionId).toBe("replacement");
+      expect(replacement.clearSession).not.toBe(true);
+      expect(ensureInputs[ensureInputs.length - 1]?.resumeSessionId).toBe("replacement");
+      expect(resumed.sessionId).toBe("replacement");
+      expect(resumed.sessionReused).toBe(true);
+    },
+  );
+
   it.each([false, true])("reports a fresh provider handle after replacement, even when turn throws: %s", async (throwTurn) => {
     const root = await makeTempRoot();
     let replaceHandle = false;

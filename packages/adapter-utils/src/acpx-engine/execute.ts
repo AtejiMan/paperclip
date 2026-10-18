@@ -4608,6 +4608,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 // only its own ensure-session sub-time on the span.
                 spanWallTimes: () => ({ ensureSession: retryEnsureSessionMs }),
               });
+              // The failed resume made the old ID unusable, but the successful
+              // fresh handshake established a replacement that must be persisted.
+              clearSession = false;
             }
           } else {
             // Warm-handle hit: a compatible cached handle reuses the running ACP
@@ -4622,7 +4625,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           }
           if (resumeSessionId && handle?.backendSessionId !== resumeSessionId) {
             resumedSession = false;
-            clearSession = true;
           }
           // A compatible warm handle reuses the already-running ACP agent and does
           // not emit another spawn event. Persist its known identity on this run
@@ -5756,10 +5758,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           capturedResult = {
             ...capturedResult,
             // The actual handshake is authoritative even when turn/receipt handling fails.
-            sessionReused: Boolean(sessionHandle) && resumedSession,
-            sessionIdBefore: sessionHandle && resumedSession
-              ? sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName
-              : null,
+            ...(sessionHandle
+              ? {
+                  sessionReused: resumedSession,
+                  sessionIdBefore: resumedSession
+                    ? sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName
+                    : null,
+                }
+              : {}),
             ...(contextTokens !== undefined ? { contextTokens } : {}),
             resultJson: {
               ...capturedResult.resultJson,
